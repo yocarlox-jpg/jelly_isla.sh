@@ -1,0 +1,848 @@
+cat > /root/jelly_manager.sh <<'BASH'
+#!/bin/bash
+
+# ============================================================
+# JELLYFIN MANAGER - BAREMETAL + RCLONE + BACKUP LOCAL
+# Adaptado para servidores con disco de 1TB
+# Mantiene mínimo 300GB libres
+# ============================================================
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+SERVER_NAME="JELLYFIN"
+JELLYFIN_SERVICE="jellyfin"
+
+CACHE_ROOT="/var/cache/rclone"
+MIN_FREE_GB=300
+
+MOUNT_LIST="/root/jelly_mounts.tsv"
+WATCHDOG_SCRIPT="/root/watchdog_jelly.sh"
+SYSTEMD_SERVICE="/etc/systemd/system/jelly-rclone-mounts.service"
+WATCHDOG_LOG="/var/log/watchdog_jelly.log"
+STATUS_FILE="/root/.jelly_status"
+
+JELLY_ETC="/etc/jellyfin"
+JELLY_VAR="/var/lib/jellyfin"
+JELLY_DB="/var/lib/jellyfin/data/jellyfin.db"
+
+JELLY_PORT="8096"
+
+DEPENDENCIAS=0
+RCLONE=0
+CONFIG=0
+ESTRUCTURA=0
+MOUNTS=0
+JELLY_OK=0
+SYSTEMD_OK=0
+CRON_OK=0
+
+pause() {
+  read -r -p "Pulsa ENTER para continuar..."
+}
+
+load_status() {
+  [ -f "$STATUS_FILE" ] && source "$STATUS_FILE"
+}
+
+save_status() {
+  cat > "$STATUS_FILE" << EOF
+DEPENDENCIAS=${DEPENDENCIAS:-0}
+RCLONE=${RCLONE:-0}
+CONFIG=${CONFIG:-0}
+ESTRUCTURA=${ESTRUCTURA:-0}
+MOUNTS=${MOUNTS:-0}
+JELLY_OK=${JELLY_OK:-0}
+SYSTEMD_OK=${SYSTEMD_OK:-0}
+CRON_OK=${CRON_OK:-0}
+EOF
+}
+
+checkmark() {
+  [ "${1:-0}" = "1" ] && echo -e "${GREEN}[✔]${NC}" || echo -e "${RED}[✘]${NC}"
+}
+
+free_gb() {
+  local path="$1"
+  mkdir -p "$path"
+  df -BG "$path" | awk 'NR==2 {gsub("G","",$4); print $4}'
+}
+
+check_min_free() {
+  local path="$1"
+  local free
+  free=$(free_gb "$path")
+  if [ "$free" -lt "$MIN_FREE_GB" ]; then
+    echo -e "${RED}ERROR:${NC} solo quedan ${free}GB libres en $path. Mínimo requerido: ${MIN_FREE_GB}GB"
+    return 1
+  fi
+  echo -e "${GREEN}OK:${NC} $path tiene ${free}GB libres"
+  return 0
+}
+
+refresh_status_from_system() {
+  command -v rclone >/dev/null 2>&1 && RCLONE=1
+  [ -f /root/.config/rclone/rclone.conf ] && [ -s /root/.config/rclone/rclone.conf ] && CONFIG=1
+  [ -f "$MOUNT_LIST" ] && ESTRUCTURA=1
+
+  if findmnt -t fuse.rclone >/dev/null 2>&1; then
+    MOUNTS=1
+  fi
+
+  if systemctl is-active --quiet "$JELLYFIN_SERVICE"; then
+    JELLY_OK=1
+  fi
+
+  if systemctl is-enabled jelly-rclone-mounts.service >/dev/null 2>&1; then
+    SYSTEMD_OK=1
+  fi
+
+  CURRENT_CRON="$(crontab -l 2>/dev/null)"
+  if echo "$CURRENT_CRON" | grep -Fq "$WATCHDOG_SCRIPT"; then
+    CRON_OK=1
+  fi
+
+  save_status
+}
+
+get_ip() {
+  hostname -I 2>/dev/null | awk '{print $1}'
+}
+
+show_jelly_link() {
+  IP=$(get_ip)
+  echo ""
+  if [ -n "$IP" ]; then
+    echo -e "${GREEN}Enlace Jellyfin:${NC} http://$IP:$JELLY_PORT/web/"
+  else
+    echo -e "${YELLOW}No pude detectar IP. Entra con:${NC} http://IP_DEL_SERVER:$JELLY_PORT/web/"
+  fi
+}
+
+show_jelly_state() {
+  echo ""
+  if systemctl is-active --quiet "$JELLYFIN_SERVICE"; then
+    echo -e "${GREEN}${JELLYFIN_SERVICE} está ACTIVO${NC}"
+  else
+    echo -e "${RED}${JELLYFIN_SERVICE} está PARADO${NC}"
+  fi
+}
+
+ensure_mount_list() {
+  if [ -f "$MOUNT_LIST" ]; then
+    return 0
+  fi
+
+  mkdir -p "$CACHE_ROOT"
+
+  # Cache ajustada para disco 1TB dejando 300GB libres.
+  # Total teórico aprox: 285GB, evitando llenar el disco.
+  cat > "$MOUNT_LIST" << EOF
+DROPBOX||/mnt/DROPBOX|$CACHE_ROOT/rclone_DROPBOX|/var/log/rclone-DROPBOX.log|10G
+00.PEL4K|@3 ! CONTENIDO/00 PEL 4K|/mnt/00.PEL4K|$CACHE_ROOT/rclone_00.PEL4K|/var/log/rclone-00.PEL4K.log|35G
+00.SER4K|@3 ! CONTENIDO/00 SER 4K|/mnt/00.SER4K|$CACHE_ROOT/rclone_00.SER4K|/var/log/rclone-00.SER4K.log|35G
+01.PEL|@3 ! CONTENIDO/01 PEL|/mnt/01.PEL|$CACHE_ROOT/rclone_01.PEL|/var/log/rclone-01.PEL.log|35G
+02.SER|@3 ! CONTENIDO/02 SER|/mnt/02.SER|$CACHE_ROOT/rclone_02.SER|/var/log/rclone-02.SER.log|60G
+03.DIB|@3 ! CONTENIDO/03 DIB|/mnt/03.DIB|$CACHE_ROOT/rclone_03.DIB|/var/log/rclone-03.DIB.log|15G
+04.DIBSER|@3 ! CONTENIDO/04 DIB SER|/mnt/04.DIBSER|$CACHE_ROOT/rclone_04.DIBSER|/var/log/rclone-04.DIBSER.log|15G
+05.ANI|@3 ! CONTENIDO/05 ANI|/mnt/05.ANI|$CACHE_ROOT/rclone_05.ANI|/var/log/rclone-05.ANI.log|15G
+06.ANISER|@3 ! CONTENIDO/06 ANI SER|/mnt/06.ANISER|$CACHE_ROOT/rclone_06.ANISER|/var/log/rclone-06.ANISER.log|15G
+07.DOC|@3 ! CONTENIDO/07 DOC|/mnt/07.DOC|$CACHE_ROOT/rclone_07.DOC|/var/log/rclone-07.DOC.log|15G
+08.DOCSER|@3 ! CONTENIDO/08 DOC SER|/mnt/08.DOCSER|$CACHE_ROOT/rclone_08.DOCSER|/var/log/rclone-08.DOCSER.log|15G
+09.PTV|@3 ! CONTENIDO/09 PTV|/mnt/09.PTV|$CACHE_ROOT/rclone_09.PTV|/var/log/rclone-09.PTV.log|10G
+10.CON|@3 ! CONTENIDO/10 CON|/mnt/10.CON|$CACHE_ROOT/rclone_10.CON|/var/log/rclone-10.CON.log|15G
+11.DEP|@3 ! CONTENIDO/11 DEP|/mnt/11.DEP|$CACHE_ROOT/rclone_11.DEP|/var/log/rclone-11.DEP.log|10G
+12.AUDLIB|@3 ! CONTENIDO/12 AUD-LIB|/mnt/12.AUDLIB|$CACHE_ROOT/rclone_12.AUDLIB|/var/log/rclone-12.AUDLIB.log|10G
+EOF
+}
+
+create_structure() {
+  ensure_mount_list
+  mkdir -p "$CACHE_ROOT"
+
+  while IFS='|' read -r remote subpath mountpoint cache_dir log_file cache_size; do
+    mkdir -p "$mountpoint" "$cache_dir"
+  done < "$MOUNT_LIST"
+
+  ESTRUCTURA=1
+  save_status
+  echo -e "${GREEN}Estructura creada.${NC}"
+}
+
+install_dependencies() {
+  echo -e "${GREEN}Instalando dependencias...${NC}"
+  apt update
+  apt install -y \
+    fuse3 curl wget unzip htop nano git ca-certificates \
+    lsb-release apt-transport-https gnupg python3 tar sqlite3 pv jq lsof
+
+  DEPENDENCIAS=1
+  save_status
+}
+
+install_rclone() {
+  echo -e "${GREEN}Instalando rclone...${NC}"
+  if command -v rclone >/dev/null 2>&1; then
+    rclone version | head -5
+  else
+    curl https://rclone.org/install.sh | bash
+  fi
+
+  mkdir -p /root/.config/rclone
+  touch /root/.config/rclone/rclone.conf
+  chmod 600 /root/.config/rclone/rclone.conf
+
+  grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' >> /etc/fuse.conf
+
+  RCLONE=1
+  save_status
+}
+
+edit_rclone_config() {
+  mkdir -p /root/.config/rclone
+  touch /root/.config/rclone/rclone.conf
+  nano /root/.config/rclone/rclone.conf
+  chmod 600 /root/.config/rclone/rclone.conf
+  grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' >> /etc/fuse.conf
+  CONFIG=1
+  save_status
+}
+
+install_jellyfin() {
+  echo -e "${GREEN}Instalando Jellyfin baremetal...${NC}"
+
+  if command -v jellyfin >/dev/null 2>&1; then
+    echo -e "${YELLOW}Jellyfin ya está instalado.${NC}"
+    jellyfin --version || true
+  else
+    apt update
+    apt install -y curl gnupg ca-certificates
+
+    curl -fsSL https://repo.jellyfin.org/install-debuntu.sh | bash
+
+    apt update
+    apt install -y jellyfin
+  fi
+
+  systemctl enable jellyfin
+  systemctl restart jellyfin
+  sleep 5
+
+  if systemctl is-active --quiet jellyfin; then
+    JELLY_OK=1
+    save_status
+    echo -e "${GREEN}Jellyfin instalado y activo.${NC}"
+  else
+    echo -e "${RED}Jellyfin no arrancó.${NC}"
+  fi
+
+  show_jelly_link
+}
+
+set_jellyfin_port() {
+  NET="$JELLY_ETC/network.xml"
+
+  mkdir -p "$JELLY_ETC"
+
+  if [ -f "$NET" ]; then
+    cp -a "$NET" "$NET.bak_port_$(date +%F_%H-%M-%S)"
+    sed -i \
+      -e "s|<InternalHttpPort>[0-9]*</InternalHttpPort>|<InternalHttpPort>$JELLY_PORT</InternalHttpPort>|g" \
+      -e "s|<PublicHttpPort>[0-9]*</PublicHttpPort>|<PublicHttpPort>$JELLY_PORT</PublicHttpPort>|g" \
+      -e "s|<HttpServerPortNumber>[0-9]*</HttpServerPortNumber>|<HttpServerPortNumber>$JELLY_PORT</HttpServerPortNumber>|g" \
+      "$NET"
+
+    grep -q "<InternalHttpPort>" "$NET" || sed -i "/<\/NetworkConfiguration>/i \  <InternalHttpPort>$JELLY_PORT</InternalHttpPort>" "$NET"
+    grep -q "<PublicHttpPort>" "$NET" || sed -i "/<\/NetworkConfiguration>/i \  <PublicHttpPort>$JELLY_PORT</PublicHttpPort>" "$NET"
+  fi
+
+  chown -R jellyfin:jellyfin "$JELLY_ETC" 2>/dev/null || true
+}
+
+generate_mount_script() {
+  ensure_mount_list
+
+  cat > /root/montar_jelly.sh << 'EOF'
+#!/bin/bash
+
+CACHE_ROOT="/var/cache/rclone"
+MOUNT_LIST="/root/jelly_mounts.tsv"
+MIN_FREE_GB=300
+
+echo "=== INICIO MONTAJE JELLY $(date) ==="
+
+mkdir -p "$CACHE_ROOT"
+
+free_gb() {
+  local path="$1"
+  mkdir -p "$path"
+  df -BG "$path" | awk 'NR==2 {gsub("G","",$4); print $4}'
+}
+
+FREE=$(free_gb "$CACHE_ROOT")
+if [ "$FREE" -lt "$MIN_FREE_GB" ]; then
+  echo "ERROR: solo quedan ${FREE}GB libres en $CACHE_ROOT. No monto para proteger disco."
+  exit 1
+fi
+
+systemctl stop jellyfin 2>/dev/null || true
+sleep 3
+
+while IFS='|' read -r remote subpath mountpoint cache_dir log_file cache_size; do
+  echo ""
+  echo ">>> Montando $remote:$subpath -> $mountpoint"
+
+  mkdir -p "$mountpoint" "$cache_dir"
+
+  if findmnt "$mountpoint" >/dev/null 2>&1; then
+    echo "Ya estaba montado: $mountpoint"
+    continue
+  fi
+
+  nohup rclone mount "${remote}:${subpath}" "$mountpoint" \
+    --allow-other \
+    --allow-non-empty \
+    --umask 002 \
+    --dir-cache-time 1000h \
+    --poll-interval 30s \
+    --buffer-size 256M \
+    --vfs-cache-mode full \
+    --vfs-cache-max-size "$cache_size" \
+    --vfs-cache-max-age 12h \
+    --vfs-read-chunk-size 512M \
+    --vfs-read-chunk-size-limit 0 \
+    --cache-dir "$cache_dir" \
+    --disable-http2 \
+    --log-file "$log_file" \
+    --log-level INFO \
+    >/dev/null 2>&1 &
+
+  sleep 2
+done < "$MOUNT_LIST"
+
+sleep 15
+
+systemctl start jellyfin 2>/dev/null || true
+
+echo ""
+echo "=== FIN MONTAJE JELLY $(date) ==="
+findmnt -t fuse.rclone || true
+EOF
+
+  chmod +x /root/montar_jelly.sh
+}
+
+generate_watchdog_script() {
+  ensure_mount_list
+
+  cat > "$WATCHDOG_SCRIPT" << EOF
+#!/bin/bash
+
+MOUNT_LIST="$MOUNT_LIST"
+LOG="$WATCHDOG_LOG"
+CACHE_ROOT="$CACHE_ROOT"
+MIN_FREE_GB="$MIN_FREE_GB"
+
+failed=0
+
+echo "\$(date) - Watchdog Jelly iniciado" >> "\$LOG"
+
+if ! systemctl is-active --quiet jellyfin; then
+  echo "\$(date) - Jellyfin parado. Arrancando..." >> "\$LOG"
+  systemctl start jellyfin >> "\$LOG" 2>&1
+fi
+
+while IFS='|' read -r remote subpath mountpoint cache_dir log_file cache_size; do
+  if ! findmnt "\$mountpoint" >/dev/null 2>&1; then
+    echo "\$(date) - ERROR mount caído: \$mountpoint" >> "\$LOG"
+    failed=1
+    continue
+  fi
+
+  if ! timeout 8 test -d "\$mountpoint"; then
+    echo "\$(date) - ERROR mount no responde: \$mountpoint" >> "\$LOG"
+    failed=1
+  fi
+done < "\$MOUNT_LIST"
+
+FREE=\$(df -BG "\$CACHE_ROOT" | awk 'NR==2 {gsub("G","",\$4); print \$4}')
+if [ "\$FREE" -lt "\$MIN_FREE_GB" ]; then
+  echo "\$(date) - AVISO cache con poco espacio: \${FREE}GB. Limpiando antiguos..." >> "\$LOG"
+  find "\$CACHE_ROOT" -type f -mmin +240 -delete 2>/dev/null || true
+fi
+
+if [ "\$failed" -eq 1 ]; then
+  echo "\$(date) - Relanzando montaje completo" >> "\$LOG"
+  /root/montar_jelly.sh >> "\$LOG" 2>&1
+fi
+EOF
+
+  chmod +x "$WATCHDOG_SCRIPT"
+}
+
+install_systemd_service() {
+  generate_mount_script
+
+  cat > "$SYSTEMD_SERVICE" << EOF
+[Unit]
+Description=Montajes rclone Jellyfin
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/root/montar_jelly.sh
+RemainAfterExit=yes
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable jelly-rclone-mounts.service
+
+  SYSTEMD_OK=1
+  save_status
+
+  echo -e "${GREEN}Systemd instalado y habilitado.${NC}"
+}
+
+install_cron_and_watchdog() {
+  generate_watchdog_script
+
+  TMP_CRON="$(mktemp)"
+  crontab -l 2>/dev/null | \
+    grep -v "$WATCHDOG_SCRIPT" | \
+    grep -v "0 4 */2 \* \* /usr/sbin/reboot" > "$TMP_CRON" || true
+
+  {
+    cat "$TMP_CRON"
+    echo "*/5 * * * * $WATCHDOG_SCRIPT >/dev/null 2>&1"
+    echo "0 4 */2 * * /usr/sbin/reboot"
+  } | crontab -
+
+  rm -f "$TMP_CRON"
+
+  CRON_OK=1
+  save_status
+
+  echo -e "${GREEN}Cron instalado:${NC}"
+  echo " - Watchdog Jelly cada 5 minutos"
+  echo " - Reboot cada 2 días a las 04:00"
+}
+
+create_media_links() {
+  echo -e "${GREEN}Creando enlaces compatibles /media -> /mnt...${NC}"
+
+  mkdir -p /media
+
+  rm -rf "/media/01 PEL" "/media/02 SER" "/media/00 PEL 4K" "/media/00 SER 4K"
+  rm -rf "/media/03 DIB" "/media/04 DIB SER" "/media/05 ANI" "/media/06 ANI SER"
+  rm -rf "/media/07 DOC" "/media/08 DOC SER" "/media/09 PTV" "/media/10 CON"
+  rm -rf "/media/11 DEP" "/media/12 AUDLIB"
+
+  ln -s /mnt/01.PEL "/media/01 PEL"
+  ln -s /mnt/02.SER "/media/02 SER"
+  ln -s /mnt/00.PEL4K "/media/00 PEL 4K"
+  ln -s /mnt/00.SER4K "/media/00 SER 4K"
+  ln -s /mnt/03.DIB "/media/03 DIB"
+  ln -s /mnt/04.DIBSER "/media/04 DIB SER"
+  ln -s /mnt/05.ANI "/media/05 ANI"
+  ln -s /mnt/06.ANISER "/media/06 ANI SER"
+  ln -s /mnt/07.DOC "/media/07 DOC"
+  ln -s /mnt/08.DOCSER "/media/08 DOC SER"
+  ln -s /mnt/09.PTV "/media/09 PTV"
+  ln -s /mnt/10.CON "/media/10 CON"
+  ln -s /mnt/11.DEP "/media/11 DEP"
+  ln -s /mnt/12.AUDLIB "/media/12 AUDLIB"
+
+  echo -e "${GREEN}Enlaces /media creados.${NC}"
+}
+
+restore_jellyfin_backup() {
+  echo -e "${YELLOW}Restaurar backup local de Jellyfin${NC}"
+  echo ""
+  read -r -p "Ruta del .tar.gz de Jellyfin: " BACKUP
+
+  if [ ! -f "$BACKUP" ]; then
+    echo -e "${RED}No existe el archivo:${NC} $BACKUP"
+    return
+  fi
+
+  echo ""
+  echo -e "${RED}ATENCIÓN:${NC} se restaurará sobre:"
+  echo " - /etc/jellyfin"
+  echo " - /var/lib/jellyfin"
+  echo ""
+  read -r -p "Escribe SI para continuar: " CONFIRMAR
+  if [ "$CONFIRMAR" != "SI" ]; then
+    echo "Cancelado."
+    return
+  fi
+
+  if ! command -v pv >/dev/null 2>&1; then
+    apt update && apt install -y pv
+  fi
+
+  TS=$(date +%F_%H-%M-%S)
+  RAW="/root/restore_jelly_raw_$TS"
+
+  mkdir -p /root/backups_jelly_pre_restore
+  mkdir -p "$RAW"
+
+  echo -e "${BLUE}1/8 Parando Jellyfin...${NC}"
+  systemctl stop jellyfin 2>/dev/null || true
+
+  echo -e "${BLUE}2/8 Backup previo...${NC}"
+  tar -czf "/root/backups_jelly_pre_restore/jelly_antes_restore_$TS.tar.gz" \
+    /etc/jellyfin /var/lib/jellyfin 2>/dev/null || true
+
+  echo -e "${BLUE}3/8 Extrayendo backup aportado...${NC}"
+  SIZE=$(du -b "$BACKUP" | awk '{print $1}')
+  pv -pterb -s "$SIZE" "$BACKUP" | tar -xzf - -C "$RAW"
+
+  if [ ! -d "$RAW/etc/jellyfin" ] || [ ! -d "$RAW/var/lib/jellyfin" ]; then
+    echo -e "${RED}El backup no contiene etc/jellyfin y var/lib/jellyfin.${NC}"
+    echo "Contenido detectado:"
+    find "$RAW" -maxdepth 3 -type d | head -80
+    return
+  fi
+
+  echo -e "${BLUE}4/8 Restaurando carpetas...${NC}"
+  rm -rf /etc/jellyfin /var/lib/jellyfin
+  cp -a "$RAW/etc/jellyfin" /etc/jellyfin
+  cp -a "$RAW/var/lib/jellyfin" /var/lib/jellyfin
+
+  echo -e "${BLUE}5/8 Corrigiendo rutas Docker/antiguas a baremetal...${NC}"
+  fix_jellyfin_paths
+
+  echo -e "${BLUE}6/8 Puerto Jellyfin...${NC}"
+  set_jellyfin_port
+
+  echo -e "${BLUE}7/8 Permisos...${NC}"
+  chown -R jellyfin:jellyfin /etc/jellyfin /var/lib/jellyfin
+  chmod -R u+rwX,go+rX /etc/jellyfin /var/lib/jellyfin
+
+  echo -e "${BLUE}8/8 Arrancando Jellyfin...${NC}"
+  systemctl start jellyfin
+
+  sleep 10
+
+  if systemctl is-active --quiet jellyfin; then
+    JELLY_OK=1
+    save_status
+    echo -e "${GREEN}Jellyfin restaurado y activo.${NC}"
+  else
+    echo -e "${RED}Jellyfin no arrancó. Mira logs.${NC}"
+    journalctl -u jellyfin -n 80 --no-pager
+  fi
+
+  rm -rf "$RAW"
+
+  show_jelly_link
+}
+
+fix_jellyfin_paths() {
+  echo -e "${GREEN}Corrigiendo rutas Jellyfin...${NC}"
+
+  if [ -f "$JELLY_DB" ]; then
+    cp -a "$JELLY_DB" "$JELLY_DB.bak_paths_$(date +%F_%H-%M-%S)"
+
+    sqlite3 "$JELLY_DB" "
+UPDATE BaseItems SET Path = REPLACE(Path, '/config/data', '/var/lib/jellyfin') WHERE Path LIKE '/config/data%';
+UPDATE BaseItems SET Path = REPLACE(Path, '/config/root', '/var/lib/jellyfin/root') WHERE Path LIKE '/config/root%';
+UPDATE BaseItems SET Path = REPLACE(Path, '/config/metadata', '/var/lib/jellyfin/metadata') WHERE Path LIKE '/config/metadata%';
+
+UPDATE BaseItems SET Path = REPLACE(Path, '/media/01 PEL', '/mnt/01.PEL') WHERE Path LIKE '/media/01 PEL%';
+UPDATE BaseItems SET Path = REPLACE(Path, '/media/02 SER', '/mnt/02.SER') WHERE Path LIKE '/media/02 SER%';
+UPDATE BaseItems SET Path = REPLACE(Path, '/media/00 PEL 4K', '/mnt/00.PEL4K') WHERE Path LIKE '/media/00 PEL 4K%';
+UPDATE BaseItems SET Path = REPLACE(Path, '/media/00 SER 4K', '/mnt/00.SER4K') WHERE Path LIKE '/media/00 SER 4K%';
+UPDATE BaseItems SET Path = REPLACE(Path, '/media/03 DIB', '/mnt/03.DIB') WHERE Path LIKE '/media/03 DIB%';
+UPDATE BaseItems SET Path = REPLACE(Path, '/media/04 DIB SER', '/mnt/04.DIBSER') WHERE Path LIKE '/media/04 DIB SER%';
+UPDATE BaseItems SET Path = REPLACE(Path, '/media/05 ANI', '/mnt/05.ANI') WHERE Path LIKE '/media/05 ANI%';
+UPDATE BaseItems SET Path = REPLACE(Path, '/media/06 ANI SER', '/mnt/06.ANISER') WHERE Path LIKE '/media/06 ANI SER%';
+UPDATE BaseItems SET Path = REPLACE(Path, '/media/07 DOC', '/mnt/07.DOC') WHERE Path LIKE '/media/07 DOC%';
+UPDATE BaseItems SET Path = REPLACE(Path, '/media/08 DOC SER', '/mnt/08.DOCSER') WHERE Path LIKE '/media/08 DOC SER%';
+UPDATE BaseItems SET Path = REPLACE(Path, '/media/09 PTV', '/mnt/09.PTV') WHERE Path LIKE '/media/09 PTV%';
+UPDATE BaseItems SET Path = REPLACE(Path, '/media/10 CON', '/mnt/10.CON') WHERE Path LIKE '/media/10 CON%';
+UPDATE BaseItems SET Path = REPLACE(Path, '/media/11 DEP', '/mnt/11.DEP') WHERE Path LIKE '/media/11 DEP%';
+UPDATE BaseItems SET Path = REPLACE(Path, '/media/12 AUDLIB', '/mnt/12.AUDLIB') WHERE Path LIKE '/media/12 AUDLIB%';
+"
+  fi
+
+  find /etc/jellyfin /var/lib/jellyfin -type f \( -name "*.xml" -o -name "*.json" \) -print0 2>/dev/null | xargs -0 sed -i \
+    -e 's|/config/data|/var/lib/jellyfin|g' \
+    -e 's|/config/root|/var/lib/jellyfin/root|g' \
+    -e 's|/config/metadata|/var/lib/jellyfin/metadata|g' \
+    -e 's|/config|/etc/jellyfin|g' \
+    -e 's|/media/01 PEL|/mnt/01.PEL|g' \
+    -e 's|/media/02 SER|/mnt/02.SER|g' \
+    -e 's|/media/00 PEL 4K|/mnt/00.PEL4K|g' \
+    -e 's|/media/00 SER 4K|/mnt/00.SER4K|g' || true
+
+  chown -R jellyfin:jellyfin /etc/jellyfin /var/lib/jellyfin 2>/dev/null || true
+}
+
+review_jellyfin_libraries() {
+  DB="$JELLY_DB"
+
+  if [ ! -f "$DB" ]; then
+    echo -e "${RED}No existe DB:${NC} $DB"
+    return
+  fi
+
+  echo -e "${BLUE}Bibliotecas CollectionFolder:${NC}"
+  sqlite3 -header -column "$DB" "
+SELECT Name, Type, Path
+FROM BaseItems
+WHERE Type LIKE '%CollectionFolder%'
+ORDER BY Name;
+"
+
+  echo ""
+  echo -e "${BLUE}Conteo por rutas /mnt:${NC}"
+  sqlite3 -header -column "$DB" "
+SELECT
+  CASE
+    WHEN Path LIKE '/mnt/00.PEL4K/%' THEN '/mnt/00.PEL4K'
+    WHEN Path LIKE '/mnt/00.SER4K/%' THEN '/mnt/00.SER4K'
+    WHEN Path LIKE '/mnt/01.PEL/%' THEN '/mnt/01.PEL'
+    WHEN Path LIKE '/mnt/02.SER/%' THEN '/mnt/02.SER'
+    WHEN Path LIKE '/mnt/03.DIB/%' THEN '/mnt/03.DIB'
+    WHEN Path LIKE '/mnt/04.DIBSER/%' THEN '/mnt/04.DIBSER'
+    WHEN Path LIKE '/mnt/05.ANI/%' THEN '/mnt/05.ANI'
+    WHEN Path LIKE '/mnt/06.ANISER/%' THEN '/mnt/06.ANISER'
+    WHEN Path LIKE '/mnt/07.DOC/%' THEN '/mnt/07.DOC'
+    WHEN Path LIKE '/mnt/08.DOCSER/%' THEN '/mnt/08.DOCSER'
+    WHEN Path LIKE '/mnt/09.PTV/%' THEN '/mnt/09.PTV'
+    WHEN Path LIKE '/mnt/10.CON/%' THEN '/mnt/10.CON'
+    WHEN Path LIKE '/mnt/11.DEP/%' THEN '/mnt/11.DEP'
+    WHEN Path LIKE '/mnt/12.AUDLIB/%' THEN '/mnt/12.AUDLIB'
+    ELSE 'OTRAS'
+  END AS Root,
+  COUNT(*) AS Items
+FROM BaseItems
+WHERE Path IS NOT NULL
+GROUP BY Root
+ORDER BY Items DESC;
+"
+}
+
+check_all_mounts() {
+  ensure_mount_list
+
+  echo -e "${BLUE}Comprobando montajes con timeouts seguros...${NC}"
+  echo ""
+
+  ok=0
+  fail=0
+  warn=0
+
+  while IFS='|' read -r remote subpath mountpoint cache_dir log_file cache_size; do
+    printf "%-25s" "$mountpoint"
+
+    if findmnt "$mountpoint" >/dev/null 2>&1; then
+      if timeout 8 find "$mountpoint" -maxdepth 1 -type d -print -quit >/dev/null 2>&1; then
+        echo -e " ${GREEN}OK${NC}"
+        ok=$((ok + 1))
+      else
+        echo -e " ${YELLOW}MONTADO PERO LENTO/BLOQUEADO${NC}"
+        warn=$((warn + 1))
+      fi
+    else
+      echo -e " ${RED}SIN MONTAR${NC}"
+      fail=$((fail + 1))
+    fi
+  done < "$MOUNT_LIST"
+
+  echo ""
+  echo -e "${GREEN}OK:${NC} $ok"
+  echo -e "${YELLOW}Lentos:${NC} $warn"
+  echo -e "${RED}Fallos:${NC} $fail"
+}
+
+full_diagnostic() {
+  echo -e "${BLUE}==============================================${NC}"
+  echo -e "${BLUE}        DIAGNÓSTICO INTEGRAL JELLYFIN${NC}"
+  echo -e "${BLUE}==============================================${NC}"
+  echo ""
+
+  echo -e "${YELLOW}1) Jellyfin${NC}"
+  systemctl status jellyfin --no-pager -l | head -35
+  echo ""
+
+  echo -e "${YELLOW}2) Puerto${NC}"
+  ss -lntp | grep "$JELLY_PORT" || true
+  echo ""
+
+  echo -e "${YELLOW}3) Disco/cache${NC}"
+  df -h /
+  df -h "$CACHE_ROOT" 2>/dev/null || true
+  echo "Libre cache: $(free_gb "$CACHE_ROOT")GB"
+  echo ""
+
+  echo -e "${YELLOW}4) Montajes${NC}"
+  check_all_mounts
+  echo ""
+
+  echo -e "${YELLOW}5) Errores rclone recientes${NC}"
+  grep -H -Ei "too_many|error|failed|rate|429|timeout" /var/log/rclone-*.log 2>/dev/null | tail -80 || echo "Sin errores claros"
+  echo ""
+
+  echo -e "${YELLOW}6) Bibliotecas Jellyfin${NC}"
+  review_jellyfin_libraries
+}
+
+show_logs() {
+  echo -e "${BLUE}====== JELLYFIN ======${NC}"
+  journalctl -u jellyfin -n 80 --no-pager || true
+  echo ""
+  echo -e "${BLUE}====== SYSTEMD MOUNTS ======${NC}"
+  systemctl status jelly-rclone-mounts.service --no-pager -l 2>/dev/null || true
+  echo ""
+  echo -e "${BLUE}====== WATCHDOG ======${NC}"
+  tail -80 "$WATCHDOG_LOG" 2>/dev/null || echo "No existe aún $WATCHDOG_LOG"
+  echo ""
+  echo -e "${BLUE}====== CRONTAB ======${NC}"
+  crontab -l 2>/dev/null || echo "No hay crontab"
+}
+
+backup_config() {
+  DEST="/root/backup_jelly_config_$(date +%F_%H-%M-%S)"
+  mkdir -p "$DEST"
+
+  [ -f /root/jelly_manager.sh ] && cp -a /root/jelly_manager.sh "$DEST/"
+  [ -f "$MOUNT_LIST" ] && cp -a "$MOUNT_LIST" "$DEST/"
+  [ -f /root/.config/rclone/rclone.conf ] && cp -a /root/.config/rclone/rclone.conf "$DEST/"
+  [ -f /root/montar_jelly.sh ] && cp -a /root/montar_jelly.sh "$DEST/"
+  [ -f "$WATCHDOG_SCRIPT" ] && cp -a "$WATCHDOG_SCRIPT" "$DEST/"
+
+  crontab -l 2>/dev/null > "$DEST/crontab.txt" || true
+  systemctl cat jelly-rclone-mounts.service > "$DEST/jelly-rclone-mounts.service.txt" 2>/dev/null || true
+
+  echo -e "${GREEN}Backup guardado en:${NC} $DEST"
+}
+
+quick_status() {
+  echo -e "${BLUE}Estado rápido${NC}"
+  echo ""
+
+  echo "Jellyfin:"
+  show_jelly_state
+  show_jelly_link
+  echo ""
+
+  echo "Puerto:"
+  ss -lntp | grep "$JELLY_PORT" || true
+  echo ""
+
+  echo "Mounts rclone:"
+  findmnt -t fuse.rclone || true
+  echo ""
+
+  echo "Disco:"
+  df -h /
+  echo ""
+
+  echo "Cache:"
+  df -h "$CACHE_ROOT" 2>/dev/null || true
+  echo "Libre cache: $(free_gb "$CACHE_ROOT")GB"
+  echo ""
+
+  echo "RAM:"
+  free -h
+}
+
+safe_scan_advice() {
+  echo -e "${YELLOW}Consejo de escaneo para evitar bloqueos:${NC}"
+  echo ""
+  echo "Para series usa SIEMPRE ruta raíz:"
+  echo "  /mnt/02.SER"
+  echo ""
+  echo "NO uses subcarpetas grandes como:"
+  echo "  /mnt/02.SER/02 SER 0-B"
+  echo ""
+  echo "Si Dropbox muestra too_many_requests, para Jellyfin y espera:"
+  echo "  systemctl stop jellyfin"
+  echo "  sleep 600"
+  echo "  systemctl start jellyfin"
+}
+
+load_status
+refresh_status_from_system
+
+while true; do
+  echo ""
+  echo -e "${BLUE}==============================================${NC}"
+  echo -e "${BLUE}      🚀 $SERVER_NAME MANAGER - 1TB SAFE${NC}"
+  echo -e "${BLUE}==============================================${NC}"
+  echo "1)  $(checkmark $DEPENDENCIAS) 📦 Instalar dependencias"
+  echo "2)  $(checkmark $RCLONE) ☁️ Instalar rclone"
+  echo "3)  $(checkmark $CONFIG) 🔑 Editar rclone.conf"
+  echo "4)  $(checkmark $ESTRUCTURA) 📁 Crear estructura /mnt + cache 1TB"
+  echo "5)  📝 Editar lista de montajes"
+  echo "6)  $(checkmark $MOUNTS) ▶️ Montar TODO"
+  echo "7)  $(checkmark $JELLY_OK) 🎬 Instalar/Actualizar Jellyfin baremetal"
+  echo "8)  💾 Restaurar backup local de Jellyfin"
+  echo "9)  🛠️ Corregir rutas Jellyfin automáticamente"
+  echo "10) 🔗 Crear enlaces compatibles /media -> /mnt"
+  echo "11) $(checkmark $SYSTEMD_OK) ⚙️ Instalar systemd arranque automático"
+  echo "12) $(checkmark $CRON_OK) 🛡️ Instalar watchdog + cron + reboot"
+  echo "13) ▶️ Iniciar Jellyfin + enlace"
+  echo "14) ♻️ Reiniciar Jellyfin"
+  echo "15) 📊 Estado rápido"
+  echo "16) 🔍 Comprobar montajes"
+  echo "17) 🩺 Diagnóstico integral"
+  echo "18) 📚 Revisar bibliotecas Jellyfin"
+  echo "19) 📜 Ver logs"
+  echo "20) 💽 Backup configuración manager"
+  echo "21) ⚠️ Consejos escaneo seguro"
+  echo "0)  ❌ Salir"
+  echo -e "${BLUE}==============================================${NC}"
+
+  read -r -p "👉 Selecciona opción: " opcion
+
+  case "$opcion" in
+    1) install_dependencies; pause ;;
+    2) install_rclone; pause ;;
+    3) edit_rclone_config; pause ;;
+    4) create_structure; pause ;;
+    5) ensure_mount_list; nano "$MOUNT_LIST"; pause ;;
+    6)
+      ensure_mount_list
+      generate_mount_script
+      bash -n /root/montar_jelly.sh || { echo -e "${RED}Script montaje con errores${NC}"; pause; continue; }
+      /root/montar_jelly.sh
+      MOUNTS=1
+      save_status
+      check_all_mounts
+      pause
+      ;;
+    7) install_jellyfin; set_jellyfin_port; pause ;;
+    8) restore_jellyfin_backup; pause ;;
+    9) systemctl stop jellyfin 2>/dev/null || true; fix_jellyfin_paths; systemctl start jellyfin; pause ;;
+    10) create_media_links; pause ;;
+    11) install_systemd_service; pause ;;
+    12) install_cron_and_watchdog; pause ;;
+    13) systemctl start jellyfin; sleep 3; show_jelly_state; show_jelly_link; pause ;;
+    14) systemctl restart jellyfin; sleep 5; show_jelly_state; show_jelly_link; pause ;;
+    15) quick_status; pause ;;
+    16) check_all_mounts; pause ;;
+    17) full_diagnostic; pause ;;
+    18) review_jellyfin_libraries; pause ;;
+    19) show_logs; pause ;;
+    20) backup_config; pause ;;
+    21) safe_scan_advice; pause ;;
+    0) exit ;;
+    *) echo "Opción no válida"; pause ;;
+  esac
+
+  refresh_status_from_system
+done
+BASH
+
+chmod +x /root/jelly_manager.sh
