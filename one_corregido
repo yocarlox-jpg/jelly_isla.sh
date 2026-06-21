@@ -538,6 +538,130 @@ create_media_links() {
   echo -e "${GREEN}Enlaces /media creados.${NC}"
 }
 
+create_portable_jellyfin_backup() {
+  echo -e "${YELLOW}Crear backup portable de Jellyfin${NC}"
+  echo ""
+  echo "Incluye:"
+  echo " - /etc/jellyfin"
+  echo " - /var/lib/jellyfin"
+  echo ""
+  echo "Sirve para migrar a otro servidor o restaurar este."
+  echo ""
+
+  if [ ! -d /etc/jellyfin ] || [ ! -d /var/lib/jellyfin ]; then
+    echo -e "${RED}No se encuentran las carpetas de Jellyfin.${NC}"
+    return
+  fi
+
+  if ! command -v pv >/dev/null 2>&1; then
+    apt update && apt install -y pv
+  fi
+
+  read -r -p "Directorio de destino [/backup]: " BACKUP_DEST
+  BACKUP_DEST="${BACKUP_DEST:-/backup}"
+  mkdir -p "$BACKUP_DEST"
+
+  if [ ! -d "$BACKUP_DEST" ] || [ ! -w "$BACKUP_DEST" ]; then
+    echo -e "${RED}No se puede escribir en:${NC} $BACKUP_DEST"
+    return
+  fi
+
+  SOURCE_SIZE=$(du -sb /etc/jellyfin /var/lib/jellyfin 2>/dev/null |
+    awk '{total += $1} END {print total + 0}')
+  AVAILABLE_SIZE=$(df -PB1 "$BACKUP_DEST" | awk 'NR==2 {print $4}')
+  RESERVE_SIZE=$((20 * 1024 * 1024 * 1024))
+
+  if [ "$SOURCE_SIZE" -le 0 ]; then
+    echo -e "${RED}No se pudo calcular el tamaño de Jellyfin.${NC}"
+    return
+  fi
+
+  echo -e "${BLUE}Datos a respaldar:${NC} $(numfmt --to=iec-i --suffix=B "$SOURCE_SIZE")"
+  echo -e "${BLUE}Espacio disponible:${NC} $(numfmt --to=iec-i --suffix=B "$AVAILABLE_SIZE")"
+
+  if [ "$SOURCE_SIZE" -gt $((AVAILABLE_SIZE - RESERVE_SIZE)) ]; then
+    echo -e "${RED}Espacio insuficiente.${NC}"
+    echo "Se exige espacio para el tamaño sin comprimir y una reserva de 20GB."
+    return
+  fi
+
+  TS=$(date +%F_%H-%M-%S)
+  HOST_SAFE=$(hostname -s | tr -cd '[:alnum:]_.-')
+  BACKUP_FILE="$BACKUP_DEST/backup_jellyfin_portable_${HOST_SAFE}_${TS}.tar.gz"
+  PARTIAL_FILE="${BACKUP_FILE}.partial"
+  CHECKSUM_FILE="${BACKUP_FILE}.sha256"
+  WAS_ACTIVE=0
+  BACKUP_OK=0
+
+  portable_backup_cleanup() {
+    if [ "$BACKUP_OK" -ne 1 ]; then
+      rm -f "$PARTIAL_FILE"
+    fi
+    if [ "$WAS_ACTIVE" -eq 1 ] && ! systemctl is-active --quiet jellyfin; then
+      systemctl start jellyfin 2>/dev/null || true
+    fi
+    rm -f "$RESTORE_LOCK"
+  }
+
+  trap '
+    echo ""
+    echo -e "${RED}Backup interrumpido. Limpiando archivo parcial...${NC}"
+    portable_backup_cleanup
+    trap - INT TERM
+    return 130
+  ' INT TERM
+
+  touch "$RESTORE_LOCK"
+
+  if systemctl is-active --quiet jellyfin; then
+    WAS_ACTIVE=1
+    echo -e "${BLUE}1/5 Deteniendo Jellyfin para congelar la base de datos...${NC}"
+    systemctl stop jellyfin
+  else
+    echo -e "${BLUE}1/5 Jellyfin ya estaba detenido.${NC}"
+  fi
+
+  echo -e "${BLUE}2/5 Creando backup portable con progreso...${NC}"
+  if ! tar -C / -cf - etc/jellyfin var/lib/jellyfin |
+    pv -pterb -s "$SOURCE_SIZE" |
+    gzip -1 > "$PARTIAL_FILE"; then
+    echo -e "${RED}Falló la creación del backup.${NC}"
+    portable_backup_cleanup
+    trap - INT TERM
+    return
+  fi
+
+  echo -e "${BLUE}3/5 Verificando el archivo completo...${NC}"
+  COMPRESSED_SIZE=$(stat -c '%s' "$PARTIAL_FILE")
+  if ! pv -pterb -s "$COMPRESSED_SIZE" "$PARTIAL_FILE" | gzip -t; then
+    echo -e "${RED}La verificación falló. El archivo parcial será eliminado.${NC}"
+    portable_backup_cleanup
+    trap - INT TERM
+    return
+  fi
+
+  echo -e "${BLUE}4/5 Guardando backup y checksum SHA-256...${NC}"
+  mv "$PARTIAL_FILE" "$BACKUP_FILE"
+  (
+    cd "$BACKUP_DEST"
+    sha256sum "$(basename "$BACKUP_FILE")"
+  ) > "$CHECKSUM_FILE"
+  chmod 600 "$BACKUP_FILE" "$CHECKSUM_FILE"
+  BACKUP_OK=1
+
+  echo -e "${BLUE}5/5 Restaurando el estado de Jellyfin...${NC}"
+  portable_backup_cleanup
+  trap - INT TERM
+
+  echo ""
+  echo -e "${GREEN}Backup portable completado.${NC}"
+  echo "📦 Archivo: $BACKUP_FILE"
+  echo "🔐 Checksum: $CHECKSUM_FILE"
+  echo "📏 Tamaño: $(du -h "$BACKUP_FILE" | awk '{print $1}')"
+  echo ""
+  echo "Puedes restaurarlo con la opción 8 en este u otro servidor."
+}
+
 restore_jellyfin_backup() {
   echo -e "${YELLOW}Restaurar backup local de Jellyfin${NC}"
   echo ""
@@ -628,11 +752,11 @@ restore_jellyfin_backup() {
   JELLY_STOPPED=0
 
   restore_cleanup() {
-    rm -f "$RESTORE_LOCK"
     rm -rf "$RAW"
     if [ "$JELLY_STOPPED" -eq 1 ] && ! systemctl is-active --quiet jellyfin; then
       systemctl start jellyfin 2>/dev/null || true
     fi
+    rm -f "$RESTORE_LOCK"
   }
 
   trap '
@@ -971,6 +1095,7 @@ while true; do
   echo "19) 📜 Ver logs"
   echo "20) 💽 Backup configuración manager"
   echo "21) ⚠️ Consejos escaneo seguro"
+  echo "22) 📦 Crear backup portable de Jellyfin"
   echo "0)  ❌ Salir"
   echo -e "${BLUE}==============================================${NC}"
 
@@ -1007,6 +1132,7 @@ while true; do
     19) show_logs; pause ;;
     20) backup_config; pause ;;
     21) safe_scan_advice; pause ;;
+    22) create_portable_jellyfin_backup; pause ;;
     0) exit ;;
     *) echo "Opción no válida"; pause ;;
   esac
