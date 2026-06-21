@@ -750,6 +750,7 @@ restore_jellyfin_backup() {
   RAW="/root/restore_jelly_raw_$TS"
   PREVIOUS_BACKUP="/root/backups_jelly_pre_restore/jelly_antes_restore_$TS.tar.gz"
   JELLY_STOPPED=0
+  RESTORE_SUCCEEDED=0
 
   restore_cleanup() {
     rm -rf "$RAW"
@@ -757,6 +758,60 @@ restore_jellyfin_backup() {
       systemctl start jellyfin 2>/dev/null || true
     fi
     rm -f "$RESTORE_LOCK"
+  }
+
+  restore_previous_installation() {
+    echo -e "${YELLOW}Recuperando automáticamente el estado anterior...${NC}"
+    systemctl stop jellyfin 2>/dev/null || true
+
+    rm -rf /etc/jellyfin /var/lib/jellyfin
+    if tar -xzf "$PREVIOUS_BACKUP" -C /; then
+      chown -R jellyfin:jellyfin /etc/jellyfin /var/lib/jellyfin 2>/dev/null || true
+      chmod -R u+rwX,go+rX /etc/jellyfin /var/lib/jellyfin 2>/dev/null || true
+      systemctl start jellyfin 2>/dev/null || true
+      sleep 10
+
+      if systemctl is-active --quiet jellyfin; then
+        JELLY_STOPPED=0
+        echo -e "${GREEN}Estado anterior recuperado y Jellyfin iniciado.${NC}"
+      else
+        echo -e "${RED}No se pudo iniciar tampoco el estado anterior.${NC}"
+      fi
+    else
+      echo -e "${RED}No se pudo extraer la copia preventiva:${NC} $PREVIOUS_BACKUP"
+    fi
+  }
+
+  prepare_restored_jellyfin() {
+    local users_count=0
+    local system_xml="/etc/jellyfin/system.xml"
+
+    if [ -f "$JELLY_DB" ] &&
+       sqlite3 "$JELLY_DB" "SELECT 1 FROM sqlite_master WHERE type='table' AND name='Users';" |
+         grep -qx 1; then
+      users_count=$(sqlite3 "$JELLY_DB" "SELECT COUNT(*) FROM Users;" 2>/dev/null || echo 0)
+    fi
+
+    if [ "${users_count:-0}" -gt 0 ]; then
+      echo -e "${BLUE}Base restaurada con $users_count usuario(s); desactivando el asistente inicial.${NC}"
+
+      if [ ! -f "$system_xml" ]; then
+        echo -e "${RED}Falta $system_xml; no es seguro iniciar la base restaurada.${NC}"
+        return 1
+      fi
+
+      if grep -q '<IsStartupWizardCompleted>false</IsStartupWizardCompleted>' "$system_xml"; then
+        sed -i \
+          's|<IsStartupWizardCompleted>false</IsStartupWizardCompleted>|<IsStartupWizardCompleted>true</IsStartupWizardCompleted>|' \
+          "$system_xml"
+      elif ! grep -q '<IsStartupWizardCompleted>true</IsStartupWizardCompleted>' "$system_xml"; then
+        sed -i \
+          '/<\/ServerConfiguration>/i \  <IsStartupWizardCompleted>true</IsStartupWizardCompleted>' \
+          "$system_xml"
+      fi
+    fi
+
+    return 0
   }
 
   trap '
@@ -771,11 +826,11 @@ restore_jellyfin_backup() {
   mkdir -p "$RAW"
   touch "$RESTORE_LOCK"
 
-  echo -e "${BLUE}1/8 Parando Jellyfin...${NC}"
+  echo -e "${BLUE}1/10 Parando Jellyfin...${NC}"
   systemctl stop jellyfin 2>/dev/null || true
   JELLY_STOPPED=1
 
-  echo -e "${BLUE}2/8 Creando copia preventiva con progreso...${NC}"
+  echo -e "${BLUE}2/10 Creando copia preventiva con progreso...${NC}"
   CURRENT_SIZE=$(du -sb /etc/jellyfin /var/lib/jellyfin 2>/dev/null | awk '{total += $1} END {print total + 0}')
   if ! tar -C / -cf - etc/jellyfin var/lib/jellyfin |
     pv -pterb -s "$CURRENT_SIZE" |
@@ -787,7 +842,7 @@ restore_jellyfin_backup() {
   fi
 
   echo -e "${GREEN}Copia preventiva:${NC} $PREVIOUS_BACKUP"
-  echo -e "${BLUE}3/8 Extrayendo backup con progreso...${NC}"
+  echo -e "${BLUE}3/10 Extrayendo backup con progreso...${NC}"
   if ! pv -pterb -s "$SIZE" "$BACKUP" | tar -xzf - -C "$RAW"; then
     echo -e "${RED}Falló la extracción. Jellyfin se volverá a iniciar.${NC}"
     restore_cleanup
@@ -804,34 +859,55 @@ restore_jellyfin_backup() {
     return
   fi
 
-  echo -e "${BLUE}4/8 Sustituyendo carpetas verificadas...${NC}"
+  echo -e "${BLUE}4/10 Sustituyendo carpetas verificadas...${NC}"
   rm -rf /etc/jellyfin /var/lib/jellyfin
   mv "$RAW/etc/jellyfin" /etc/jellyfin
   mv "$RAW/var/lib/jellyfin" /var/lib/jellyfin
 
-  echo -e "${BLUE}5/8 Corrigiendo rutas Docker/antiguas a baremetal...${NC}"
+  echo -e "${BLUE}5/10 Corrigiendo rutas Docker/antiguas a baremetal...${NC}"
   fix_jellyfin_paths
 
-  echo -e "${BLUE}6/8 Puerto Jellyfin...${NC}"
+  echo -e "${BLUE}6/10 Puerto Jellyfin...${NC}"
   set_jellyfin_port
 
-  echo -e "${BLUE}7/8 Permisos...${NC}"
+  echo -e "${BLUE}7/10 Preparando estado restaurado...${NC}"
+  if ! prepare_restored_jellyfin; then
+    restore_previous_installation
+    restore_cleanup
+    trap - INT TERM
+    return
+  fi
+
+  echo -e "${BLUE}8/10 Permisos...${NC}"
   chown -R jellyfin:jellyfin /etc/jellyfin /var/lib/jellyfin
   chmod -R u+rwX,go+rX /etc/jellyfin /var/lib/jellyfin
 
-  echo -e "${BLUE}8/8 Arrancando Jellyfin...${NC}"
+  echo -e "${BLUE}9/10 Arrancando Jellyfin y aplicando migraciones oficiales...${NC}"
+  START_TIME=$(date --iso-8601=seconds)
   systemctl start jellyfin
 
-  sleep 10
+  echo -e "${BLUE}10/10 Comprobando servicio y API de salud...${NC}"
+  for _ in $(seq 1 18); do
+    if systemctl is-active --quiet jellyfin &&
+       curl -fsS http://127.0.0.1:"$JELLY_PORT"/health 2>/dev/null |
+         grep -q '^Healthy'; then
+      RESTORE_SUCCEEDED=1
+      break
+    fi
+    sleep 5
+  done
 
-  if systemctl is-active --quiet jellyfin; then
+  if [ "$RESTORE_SUCCEEDED" -eq 1 ] &&
+     ! journalctl -u jellyfin --since "$START_TIME" --no-pager 2>/dev/null |
+       grep -Eiq 'migration .* failed|no such column|database is malformed|\[FTL\]|fatal'; then
     JELLY_STOPPED=0
     JELLY_OK=1
     save_status
-    echo -e "${GREEN}Jellyfin restaurado y activo.${NC}"
+    echo -e "${GREEN}Jellyfin restaurado, migrado y saludable.${NC}"
   else
-    echo -e "${RED}Jellyfin no arrancó. Mira logs.${NC}"
+    echo -e "${RED}La restauración no superó la comprobación de salud.${NC}"
     journalctl -u jellyfin -n 80 --no-pager
+    restore_previous_installation
   fi
 
   restore_cleanup
