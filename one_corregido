@@ -33,6 +33,7 @@ WATCHDOG_SCRIPT="/root/watchdog_jelly.sh"
 SYSTEMD_SERVICE="/etc/systemd/system/jelly-rclone-mounts.service"
 WATCHDOG_LOG="/var/log/watchdog_jelly.log"
 STATUS_FILE="/root/.jelly_status"
+RESTORE_LOCK="/tmp/jellyfin_restore.lock"
 
 JELLY_ETC="/etc/jellyfin"
 JELLY_VAR="/var/lib/jellyfin"
@@ -391,10 +392,16 @@ MOUNT_LIST="$MOUNT_LIST"
 LOG="$WATCHDOG_LOG"
 CACHE_ROOT="$CACHE_ROOT"
 MIN_FREE_GB="$MIN_FREE_GB"
+RESTORE_LOCK="$RESTORE_LOCK"
 
 failed=0
 
 echo "\$(date) - Watchdog Jelly iniciado" >> "\$LOG"
+
+if [ -e "\$RESTORE_LOCK" ]; then
+  echo "\$(date) - Restauración Jellyfin activa. Watchdog en espera." >> "\$LOG"
+  exit 0
+fi
 
 if ! systemctl is-active --quiet jellyfin; then
   echo "\$(date) - Jellyfin parado. Arrancando..." >> "\$LOG"
@@ -534,35 +541,77 @@ create_media_links() {
 restore_jellyfin_backup() {
   echo -e "${YELLOW}Restaurar backup local de Jellyfin${NC}"
   echo ""
-  read -r -p "Ruta del .tar.gz de Jellyfin: " BACKUP
+
+  DEFAULT_BACKUP="$(
+    find /backup /root/backup /sdb -maxdepth 3 -type f \
+      \( -name "*.tar.gz" -o -name "*.tgz" \) \
+      -printf '%T@|%p\n' 2>/dev/null |
+      sort -t '|' -k1,1nr |
+      head -1 |
+      cut -d '|' -f2-
+  )"
+
+  if [ -n "$DEFAULT_BACKUP" ]; then
+    echo -e "${GREEN}Backup más reciente detectado:${NC}"
+    echo "$DEFAULT_BACKUP"
+    read -r -p "Pulsa ENTER para usarlo o escribe otra ruta: " BACKUP
+    BACKUP="${BACKUP:-$DEFAULT_BACKUP}"
+  else
+    read -r -p "Ruta del .tar.gz de Jellyfin: " BACKUP
+  fi
 
   if [ ! -f "$BACKUP" ]; then
     echo -e "${RED}No existe el archivo:${NC} $BACKUP"
     return
   fi
 
-  TAR_LIST="$(mktemp)"
-  if ! tar -tzf "$BACKUP" > "$TAR_LIST" 2>/dev/null; then
-    echo -e "${RED}El archivo no es un .tar.gz válido o está dañado.${NC}"
-    rm -f "$TAR_LIST"
-    return
+  if ! command -v pv >/dev/null 2>&1; then
+    apt update && apt install -y pv
   fi
 
-  if grep -Eq '(^/|(^|/)\.\.(/|$))' "$TAR_LIST"; then
-    echo -e "${RED}Backup rechazado:${NC} contiene rutas absolutas o recorridos '..'."
-    rm -f "$TAR_LIST"
-    return
-  fi
-
-  if ! grep -Eq '^(\./)?etc/jellyfin(/|$)' "$TAR_LIST" ||
-     ! grep -Eq '^(\./)?var/lib/jellyfin(/|$)' "$TAR_LIST"; then
-    echo -e "${RED}El backup no contiene etc/jellyfin y var/lib/jellyfin.${NC}"
-    rm -f "$TAR_LIST"
-    return
-  fi
-  rm -f "$TAR_LIST"
+  SIZE=$(stat -c '%s' "$BACKUP")
+  HUMAN_SIZE=$(du -h "$BACKUP" | awk '{print $1}')
+  VALIDATION_RESULT="$(mktemp)"
 
   echo ""
+  echo -e "${BLUE}Verificando backup de $HUMAN_SIZE...${NC}"
+  echo "Esta comprobación lee el archivo completo y mostrará porcentaje, velocidad y tiempo."
+
+  if ! pv -pterb -s "$SIZE" "$BACKUP" |
+    tar -tzf - |
+    awk -v result="$VALIDATION_RESULT" '
+      {
+        name=$0
+        sub(/^\.\//, "", name)
+        if (name ~ /^\// || name ~ /(^|\/)\.\.(\/|$)/) unsafe=1
+        if (name == "etc/jellyfin" || index(name, "etc/jellyfin/") == 1) has_etc=1
+        if (name == "var/lib/jellyfin" || index(name, "var/lib/jellyfin/") == 1) has_var=1
+      }
+      END {
+        printf "%d %d %d\n", unsafe, has_etc, has_var > result
+        if (unsafe) exit 2
+      }
+    '; then
+    echo -e "${RED}El archivo no es válido, está dañado o contiene rutas inseguras.${NC}"
+    rm -f "$VALIDATION_RESULT"
+    return
+  fi
+
+  read -r HAS_UNSAFE HAS_ETC HAS_VAR < "$VALIDATION_RESULT"
+  rm -f "$VALIDATION_RESULT"
+
+  if [ "$HAS_UNSAFE" -ne 0 ]; then
+    echo -e "${RED}Backup rechazado:${NC} contiene rutas absolutas o recorridos '..'."
+    return
+  fi
+
+  if [ "$HAS_ETC" -ne 1 ] || [ "$HAS_VAR" -ne 1 ]; then
+    echo -e "${RED}El backup no contiene etc/jellyfin y var/lib/jellyfin.${NC}"
+    return
+  fi
+
+  echo ""
+  echo -e "${GREEN}Verificación completada correctamente.${NC}"
   echo -e "${RED}ATENCIÓN:${NC} se restaurará sobre:"
   echo " - /etc/jellyfin"
   echo " - /var/lib/jellyfin"
@@ -573,29 +622,52 @@ restore_jellyfin_backup() {
     return
   fi
 
-  if ! command -v pv >/dev/null 2>&1; then
-    apt update && apt install -y pv
-  fi
-
   TS=$(date +%F_%H-%M-%S)
   RAW="/root/restore_jelly_raw_$TS"
+  PREVIOUS_BACKUP="/root/backups_jelly_pre_restore/jelly_antes_restore_$TS.tar.gz"
+  JELLY_STOPPED=0
+
+  restore_cleanup() {
+    rm -f "$RESTORE_LOCK"
+    rm -rf "$RAW"
+    if [ "$JELLY_STOPPED" -eq 1 ] && ! systemctl is-active --quiet jellyfin; then
+      systemctl start jellyfin 2>/dev/null || true
+    fi
+  }
+
+  trap '
+    echo ""
+    echo -e "${RED}Restauración interrumpida. Limpiando y arrancando Jellyfin...${NC}"
+    restore_cleanup
+    trap - INT TERM
+    return 130
+  ' INT TERM
 
   mkdir -p /root/backups_jelly_pre_restore
   mkdir -p "$RAW"
+  touch "$RESTORE_LOCK"
 
   echo -e "${BLUE}1/8 Parando Jellyfin...${NC}"
   systemctl stop jellyfin 2>/dev/null || true
+  JELLY_STOPPED=1
 
-  echo -e "${BLUE}2/8 Backup previo...${NC}"
-  tar -czf "/root/backups_jelly_pre_restore/jelly_antes_restore_$TS.tar.gz" \
-    /etc/jellyfin /var/lib/jellyfin 2>/dev/null || true
+  echo -e "${BLUE}2/8 Creando copia preventiva con progreso...${NC}"
+  CURRENT_SIZE=$(du -sb /etc/jellyfin /var/lib/jellyfin 2>/dev/null | awk '{total += $1} END {print total + 0}')
+  if ! tar -C / -cf - etc/jellyfin var/lib/jellyfin |
+    pv -pterb -s "$CURRENT_SIZE" |
+    gzip > "$PREVIOUS_BACKUP"; then
+    echo -e "${RED}No se pudo crear la copia preventiva. Se cancela sin modificar Jellyfin.${NC}"
+    restore_cleanup
+    trap - INT TERM
+    return
+  fi
 
-  echo -e "${BLUE}3/8 Extrayendo backup aportado...${NC}"
-  SIZE=$(du -b "$BACKUP" | awk '{print $1}')
+  echo -e "${GREEN}Copia preventiva:${NC} $PREVIOUS_BACKUP"
+  echo -e "${BLUE}3/8 Extrayendo backup con progreso...${NC}"
   if ! pv -pterb -s "$SIZE" "$BACKUP" | tar -xzf - -C "$RAW"; then
     echo -e "${RED}Falló la extracción. Jellyfin se volverá a iniciar.${NC}"
-    systemctl start jellyfin 2>/dev/null || true
-    rm -rf "$RAW"
+    restore_cleanup
+    trap - INT TERM
     return
   fi
 
@@ -603,15 +675,15 @@ restore_jellyfin_backup() {
     echo -e "${RED}El backup no contiene etc/jellyfin y var/lib/jellyfin.${NC}"
     echo "Contenido detectado:"
     find "$RAW" -maxdepth 3 -type d | head -80
-    systemctl start jellyfin 2>/dev/null || true
-    rm -rf "$RAW"
+    restore_cleanup
+    trap - INT TERM
     return
   fi
 
-  echo -e "${BLUE}4/8 Restaurando carpetas...${NC}"
+  echo -e "${BLUE}4/8 Sustituyendo carpetas verificadas...${NC}"
   rm -rf /etc/jellyfin /var/lib/jellyfin
-  cp -a "$RAW/etc/jellyfin" /etc/jellyfin
-  cp -a "$RAW/var/lib/jellyfin" /var/lib/jellyfin
+  mv "$RAW/etc/jellyfin" /etc/jellyfin
+  mv "$RAW/var/lib/jellyfin" /var/lib/jellyfin
 
   echo -e "${BLUE}5/8 Corrigiendo rutas Docker/antiguas a baremetal...${NC}"
   fix_jellyfin_paths
@@ -629,6 +701,7 @@ restore_jellyfin_backup() {
   sleep 10
 
   if systemctl is-active --quiet jellyfin; then
+    JELLY_STOPPED=0
     JELLY_OK=1
     save_status
     echo -e "${GREEN}Jellyfin restaurado y activo.${NC}"
@@ -637,7 +710,8 @@ restore_jellyfin_backup() {
     journalctl -u jellyfin -n 80 --no-pager
   fi
 
-  rm -rf "$RAW"
+  restore_cleanup
+  trap - INT TERM
 
   show_jelly_link
 }
