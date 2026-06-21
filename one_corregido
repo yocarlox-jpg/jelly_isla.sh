@@ -12,8 +12,8 @@ set -o pipefail
 
 # ============================================================
 # JELLYFIN MANAGER - BAREMETAL + RCLONE + BACKUP LOCAL
-# Adaptado para servidores con disco de 1TB
-# Mantiene mínimo 300GB libres
+# Adaptado para AMS830675 con SSD secundario montado en /sdb
+# Mantiene mínimo 150GB libres en el disco de caché
 # ============================================================
 
 RED='\033[0;31m'
@@ -25,8 +25,8 @@ NC='\033[0m'
 SERVER_NAME="JELLYFIN"
 JELLYFIN_SERVICE="jellyfin"
 
-CACHE_ROOT="/var/cache/rclone"
-MIN_FREE_GB=300
+CACHE_ROOT="/sdb/rclone-cache"
+MIN_FREE_GB=150
 
 MOUNT_LIST="/root/jelly_mounts.tsv"
 WATCHDOG_SCRIPT="/root/watchdog_jelly.sh"
@@ -90,6 +90,14 @@ check_min_free() {
   fi
   echo -e "${GREEN}OK:${NC} $path tiene ${free}GB libres"
   return 0
+}
+
+check_cache_disk() {
+  if ! mountpoint -q /sdb; then
+    echo -e "${RED}ERROR:${NC} /sdb no está montado. Se cancela para no escribir la caché en el disco del sistema."
+    return 1
+  fi
+  check_min_free "$CACHE_ROOT"
 }
 
 refresh_status_from_system() {
@@ -160,30 +168,32 @@ ensure_mount_list() {
     return 0
   fi
 
+  check_cache_disk || return 1
   mkdir -p "$CACHE_ROOT"
 
-  # Cache ajustada para disco 1TB dejando 300GB libres.
-  # Total teórico máximo: 310GB, evitando llenar el disco.
+  # Cache alojada en el segundo SSD de 466GB.
+  # Total teórico máximo: 205GB, dejando al menos 150GB libres.
   cat > "$MOUNT_LIST" << EOF
-DROPBOX||/mnt/DROPBOX|$CACHE_ROOT/rclone_DROPBOX|/var/log/rclone-DROPBOX.log|10G
-00.PEL4K|@3 ! CONTENIDO/00 PEL 4K|/mnt/00.PEL4K|$CACHE_ROOT/rclone_00.PEL4K|/var/log/rclone-00.PEL4K.log|35G
-00.SER4K|@3 ! CONTENIDO/00 SER 4K|/mnt/00.SER4K|$CACHE_ROOT/rclone_00.SER4K|/var/log/rclone-00.SER4K.log|35G
-01.PEL|@3 ! CONTENIDO/01 PEL|/mnt/01.PEL|$CACHE_ROOT/rclone_01.PEL|/var/log/rclone-01.PEL.log|35G
-02.SER|@3 ! CONTENIDO/02 SER|/mnt/02.SER|$CACHE_ROOT/rclone_02.SER|/var/log/rclone-02.SER.log|60G
-03.DIB|@3 ! CONTENIDO/03 DIB|/mnt/03.DIB|$CACHE_ROOT/rclone_03.DIB|/var/log/rclone-03.DIB.log|15G
-04.DIBSER|@3 ! CONTENIDO/04 DIB SER|/mnt/04.DIBSER|$CACHE_ROOT/rclone_04.DIBSER|/var/log/rclone-04.DIBSER.log|15G
-05.ANI|@3 ! CONTENIDO/05 ANI|/mnt/05.ANI|$CACHE_ROOT/rclone_05.ANI|/var/log/rclone-05.ANI.log|15G
-06.ANISER|@3 ! CONTENIDO/06 ANI SER|/mnt/06.ANISER|$CACHE_ROOT/rclone_06.ANISER|/var/log/rclone-06.ANISER.log|15G
-07.DOC|@3 ! CONTENIDO/07 DOC|/mnt/07.DOC|$CACHE_ROOT/rclone_07.DOC|/var/log/rclone-07.DOC.log|15G
-08.DOCSER|@3 ! CONTENIDO/08 DOC SER|/mnt/08.DOCSER|$CACHE_ROOT/rclone_08.DOCSER|/var/log/rclone-08.DOCSER.log|15G
-09.PTV|@3 ! CONTENIDO/09 PTV|/mnt/09.PTV|$CACHE_ROOT/rclone_09.PTV|/var/log/rclone-09.PTV.log|10G
-10.CON|@3 ! CONTENIDO/10 CON|/mnt/10.CON|$CACHE_ROOT/rclone_10.CON|/var/log/rclone-10.CON.log|15G
-11.DEP|@3 ! CONTENIDO/11 DEP|/mnt/11.DEP|$CACHE_ROOT/rclone_11.DEP|/var/log/rclone-11.DEP.log|10G
-12.AUDLIB|@3 ! CONTENIDO/12 AUD-LIB|/mnt/12.AUDLIB|$CACHE_ROOT/rclone_12.AUDLIB|/var/log/rclone-12.AUDLIB.log|10G
+DROPBOX||/mnt/DROPBOX|$CACHE_ROOT/rclone_DROPBOX|/var/log/rclone-DROPBOX.log|5G
+00.PEL4K|@3 ! CONTENIDO/00 PEL 4K|/mnt/00.PEL4K|$CACHE_ROOT/rclone_00.PEL4K|/var/log/rclone-00.PEL4K.log|25G
+00.SER4K|@3 ! CONTENIDO/00 SER 4K|/mnt/00.SER4K|$CACHE_ROOT/rclone_00.SER4K|/var/log/rclone-00.SER4K.log|25G
+01.PEL|@3 ! CONTENIDO/01 PEL|/mnt/01.PEL|$CACHE_ROOT/rclone_01.PEL|/var/log/rclone-01.PEL.log|25G
+02.SER|@3 ! CONTENIDO/02 SER|/mnt/02.SER|$CACHE_ROOT/rclone_02.SER|/var/log/rclone-02.SER.log|40G
+03.DIB|@3 ! CONTENIDO/03 DIB|/mnt/03.DIB|$CACHE_ROOT/rclone_03.DIB|/var/log/rclone-03.DIB.log|10G
+04.DIBSER|@3 ! CONTENIDO/04 DIB SER|/mnt/04.DIBSER|$CACHE_ROOT/rclone_04.DIBSER|/var/log/rclone-04.DIBSER.log|10G
+05.ANI|@3 ! CONTENIDO/05 ANI|/mnt/05.ANI|$CACHE_ROOT/rclone_05.ANI|/var/log/rclone-05.ANI.log|10G
+06.ANISER|@3 ! CONTENIDO/06 ANI SER|/mnt/06.ANISER|$CACHE_ROOT/rclone_06.ANISER|/var/log/rclone-06.ANISER.log|10G
+07.DOC|@3 ! CONTENIDO/07 DOC|/mnt/07.DOC|$CACHE_ROOT/rclone_07.DOC|/var/log/rclone-07.DOC.log|10G
+08.DOCSER|@3 ! CONTENIDO/08 DOC SER|/mnt/08.DOCSER|$CACHE_ROOT/rclone_08.DOCSER|/var/log/rclone-08.DOCSER.log|10G
+09.PTV|@3 ! CONTENIDO/09 PTV|/mnt/09.PTV|$CACHE_ROOT/rclone_09.PTV|/var/log/rclone-09.PTV.log|5G
+10.CON|@3 ! CONTENIDO/10 CON|/mnt/10.CON|$CACHE_ROOT/rclone_10.CON|/var/log/rclone-10.CON.log|10G
+11.DEP|@3 ! CONTENIDO/11 DEP|/mnt/11.DEP|$CACHE_ROOT/rclone_11.DEP|/var/log/rclone-11.DEP.log|5G
+12.AUDLIB|@3 ! CONTENIDO/12 AUD-LIB|/mnt/12.AUDLIB|$CACHE_ROOT/rclone_12.AUDLIB|/var/log/rclone-12.AUDLIB.log|5G
 EOF
 }
 
 create_structure() {
+  check_cache_disk || return 1
   ensure_mount_list
   mkdir -p "$CACHE_ROOT"
 
@@ -293,11 +303,16 @@ generate_mount_script() {
   cat > /root/montar_jelly.sh << 'EOF'
 #!/bin/bash
 
-CACHE_ROOT="/var/cache/rclone"
+CACHE_ROOT="/sdb/rclone-cache"
 MOUNT_LIST="/root/jelly_mounts.tsv"
-MIN_FREE_GB=300
+MIN_FREE_GB=150
 
 echo "=== INICIO MONTAJE JELLY $(date) ==="
+
+if ! mountpoint -q /sdb; then
+  echo "ERROR: /sdb no está montado. No se inicia rclone para proteger el disco del sistema."
+  exit 1
+fi
 
 mkdir -p "$CACHE_ROOT"
 
@@ -859,12 +874,12 @@ refresh_status_from_system
 while true; do
   echo ""
   echo -e "${BLUE}==============================================${NC}"
-  echo -e "${BLUE}      🚀 $SERVER_NAME MANAGER - 1TB SAFE${NC}"
+  echo -e "${BLUE}   🚀 $SERVER_NAME MANAGER - DUAL SSD SAFE${NC}"
   echo -e "${BLUE}==============================================${NC}"
   echo "1)  $(checkmark $DEPENDENCIAS) 📦 Instalar dependencias"
   echo "2)  $(checkmark $RCLONE) ☁️ Instalar rclone"
   echo "3)  $(checkmark $CONFIG) 🔑 Editar rclone.conf"
-  echo "4)  $(checkmark $ESTRUCTURA) 📁 Crear estructura /mnt + cache 1TB"
+  echo "4)  $(checkmark $ESTRUCTURA) 📁 Crear estructura /mnt + caché en /sdb"
   echo "5)  📝 Editar lista de montajes"
   echo "6)  $(checkmark $MOUNTS) ▶️ Montar TODO"
   echo "7)  $(checkmark $JELLY_OK) 🎬 Instalar/Actualizar Jellyfin baremetal"
